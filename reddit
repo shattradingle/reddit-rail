@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# thin wrapper so `reddit` works as a command without a pip install
+exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/reddit.py" "$@"
