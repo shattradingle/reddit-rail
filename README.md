@@ -99,3 +99,11 @@ when you want right now.
 ## Licence
 
 MIT. See `LICENSE`.
+
+## Tests
+
+Offline, no network, no credentials:
+
+```console
+python -m unittest -v     # 13 cases
+```
