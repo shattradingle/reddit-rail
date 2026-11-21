@@ -171,7 +171,7 @@ So `search` fans out over a list of subreddits, which is what research wants any
 
 ## The cache is the point
 
-Every fetch lands in SQLite under `$XDG_STATE_HOME/reddit-rail/`. A repeat question costs **0.07s and zero network**, so you can ask the same thing twenty times while narrowing a question, and the archive going down cannot lose work already fetched. `--offline` refuses the network entirely; `warm` keeps the corpus fresh on a timer.
+Every fetch lands in SQLite under `$XDG_STATE_HOME/reddit-rail/`. A repeat question costs **well under a second and zero network**, so you can ask the same thing twenty times while narrowing a question, and the archive going down cannot lose work already fetched. `--offline` refuses the network entirely; `warm` keeps the corpus fresh on a timer.
 
 ## Comparison
 
@@ -206,7 +206,7 @@ Offline, fixture-driven, no network and no credentials:
 
 ```console
 $ pytest -q
-41 passed in 0.4s
+41 passed in 0.08s
 ```
 
 ## Part of the keyless stack
