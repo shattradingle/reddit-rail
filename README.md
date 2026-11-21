@@ -49,17 +49,21 @@ $ reddit --help
 
 ![reddit search, thread and ask - real output](docs/shots/demo.png)
 
-`search` gives you threads. `ask` opens the top ones and hands back the highest-scoring comments verbatim, each with its score and permalink, which is usually the part you actually wanted:
+`search` gives you threads. `ask` opens the top ones and hands back the highest-scoring comments verbatim, each with its score and permalink, which is usually the part you actually wanted. Real output, run `--offline` against a corpus this machine had already fetched:
 
 ```console
-$ reddit ask "bose anc hiss" --subs bose --threads 3 --quotes 5
-## ask: bose anc hiss
-_3 threads · 214 comments · 11 quotes · 1 subs · 2 live fetches · 12.8s_
+$ reddit ask "claude code" --subs ClaudeAI --offline
+## ask: claude code
+_1 threads · 3 comments · 1 quotes · 1 subs · 0 live fetches · 0.0s_
+_skipped: 1y1cjpw(not cached), 1y1h58o(not cached)_
 
-### 1. <thread title> - r/bose · 2026-11-12 · 41pts · 26 comments
-https://www.reddit.com/r/bose/comments/…
-> [18pts] u/…: …
+### 1. I built a pipeline that compiles product demo videos from code with Claude Code. Open source repo in the post. - r/ClaudeAI · 2026-11-20 · 1pts · 3 comments
+https://www.reddit.com/r/ClaudeAI/comments/1y14ij6/i_built_a_pipeline_that_compiles_product_demo/
+
+> [2pts] u/Far_Reindeer8428: a fresh session reviewing the pipeline is the underrated part, the builder never catches its own render assumptions
 ```
+
+The `_skipped:_` line is the feature, not a bug: threads it did not open are named with the reason instead of being silently dropped.
 
 `thread` renders the whole tree, nested, with scores:
 
