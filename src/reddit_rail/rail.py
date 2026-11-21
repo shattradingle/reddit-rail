@@ -61,6 +61,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
+__version__ = "2.0.0"
+
 # ---------------------------------------------------------------- config
 
 HOME = Path.home()
@@ -165,9 +167,29 @@ class Health:
 
 
 HEALTH = Health()
+DEADLINE = [0.0]          # monotonic timestamp; 0 == no deadline
 _PACE_LOCK = threading.Lock()
 _LAST_CALL = [0.0]
 MIN_INTERVAL = float(os.environ.get("REDDIT_MIN_INTERVAL", "0.45"))
+
+
+def set_deadline(seconds) -> None:
+    """Set a hard wall for this command. Every sleep inside a fetch respects it."""
+    DEADLINE[0] = (time.monotonic() + float(seconds)) if seconds else 0.0
+
+
+def _left():
+    return None if not DEADLINE[0] else DEADLINE[0] - time.monotonic()
+
+
+def _sleep(seconds: float) -> None:
+    left = _left()
+    if left is not None:
+        if left <= 0:
+            raise FetchError(0, "deadline reached")
+        seconds = min(seconds, left)
+    if seconds > 0:
+        time.sleep(seconds)
 
 
 def _pace():
@@ -204,7 +226,7 @@ def _wait_global_cooldown(provider: str) -> None:
     until = int(cd.get(provider, 0))
     left = until - now_utc()
     if left > 0:
-        time.sleep(min(left, 45))
+        _sleep(min(left, 45))
 
 
 class FetchError(Exception):
@@ -241,24 +263,24 @@ def get(url: str, provider: str, tries: int = 3, timeout: int = 25,
             HEALTH.record(provider, False, body[:120] or e.reason, e.code)
             if e.code == 429:
                 reset = _note_reset(provider, e.headers, default=20)
-                time.sleep(min(reset + 0.5, 45))
+                _sleep(min(reset + 0.5, 45))
             elif e.code in (500, 502, 503, 504, 520, 521, 522, 526, 422):
                 # arctic-shift uses 422 for "Timeout. Maybe slow down a bit", and its
                 # real lockout is ~75s. A 1.5s retry burns every attempt inside that
                 # window and reports 0ok/3fail (measured 2026-11-08), so escalate past
                 # the lockout instead of hammering it.
                 if provider == "arctic-shift" and e.code == 422:
-                    time.sleep(min(20 * (attempt + 1), 75))
+                    _sleep(min(20 * (attempt + 1), 75))
                 else:
-                    time.sleep(1.5 * (attempt + 1))
+                    _sleep(1.5 * (attempt + 1))
             elif e.code in (400, 403, 404):
                 raise last
             else:
-                time.sleep(1.0)
+                _sleep(1.0)
         except Exception as e:  # timeout, DNS, connection reset
             last = FetchError(0, str(e))
             HEALTH.record(provider, False, str(e)[:120], 0)
-            time.sleep(1.5 * (attempt + 1))
+            _sleep(1.5 * (attempt + 1))
     raise last
 
 
@@ -375,6 +397,7 @@ create table if not exists posts(
 create table if not exists threads(
   id text primary key, md text, fetched_at integer);
 create index if not exists posts_query on posts(sub, created_utc);
+create table if not exists comments(post_id text primary key, json text, fetched_at integer);
 create table if not exists runs(key text primary key, at integer);
 create table if not exists subs_seen(sub text primary key, at integer);
 """
@@ -516,6 +539,28 @@ def cached_thread(pid, max_age_h=72):
     return None
 
 
+def cache_comments(pid, comments):
+    """Raw comments as JSON so `ask` and `thread` never re-fetch the same thread."""
+    con = _db()
+    with con:
+        con.execute("insert or replace into comments values(?,?,?)",
+                    (pid, json.dumps(comments), now_utc()))
+    con.close()
+
+
+def cached_comments(pid, max_age_h=72):
+    try:
+        con = _db()
+        row = con.execute("select json, fetched_at from comments where post_id=?",
+                          (pid,)).fetchone()
+        con.close()
+        if row and now_utc() - row[1] < max_age_h * 3600:
+            return json.loads(row[0])
+    except Exception:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------- ranking
 
 def rank(rows, query, window=None, limit=40):
@@ -640,75 +685,96 @@ def cmd_warm(args):
     return 0 if done else 2
 
 
-def cmd_search(args):
-    if args.subs:
-        subs = register_subs(args.subs.split(","))
-    elif getattr(args, "all_subs", False):
-        subs = default_subs(priority=False)
-    else:
-        subs = default_subs(priority=True)
-    queries = args.query or []
-    if not queries:
-        log("reddit search: need a query")
-        return 2
+def select_subs(args):
+    if getattr(args, "subs", None):
+        return register_subs(args.subs.split(","))
+    if getattr(args, "all_subs", False):
+        return default_subs(priority=False)
+    return default_subs(priority=True)
 
+
+def collect_search(subs, queries, *, live=True, budget=12, deadline=60.0,
+                   window="all", limit=40, fresh=6.0, quiet=False):
+    """One search over the local corpus, optionally topped up live. Shared by
+    `search` and `ask` so both commands see exactly the same ranking."""
     t0 = time.time()
+    q = " ".join(queries)
     all_rows, fetched, failed, spent = [], 0, [], 0
 
-    # 1. always answer from the local corpus first - this is instant and cannot rate-limit
+    # 1. the local corpus answers first: instant, and it cannot rate-limit.
     for sub in subs:
-        all_rows.extend(cached_posts_for(sub, " ".join(queries)))
+        all_rows.extend(cached_posts_for(sub, q))
 
-    # 2. optionally top up live, within the request budget
-    if args.live:
+    # 2. top up live inside a request budget, skipping subs fetched recently.
+    if live:
         for sub in subs:
-            if spent >= args.budget or time.time() - t0 > args.deadline:
+            if spent >= budget or time.time() - t0 > deadline:
                 break
             age = seen_age_h(sub)
-            if age is not None and age < args.fresh:
+            if age is not None and age < fresh:
                 continue
             spent += 1
             try:
-                rows = arctic_posts(sub, " ".join(queries), limit=100)
+                rows = arctic_posts(sub, q, limit=100)
                 cache_posts(rows)
                 mark_seen(sub)
                 fetched += 1
                 all_rows.extend(rows)
             except FetchError as e:
-                # a different service, a different limit: worth one try
-                try:
-                    rows = rss_search(sub, " ".join(queries), args.window)
+                try:                      # a different service, a different limit
+                    rows = rss_search(sub, q, window)
                     cache_posts(rows)
                     all_rows.extend(rows)
                     fetched += 1
                 except FetchError:
                     failed.append(sub)
                     if getattr(e, "code", 0) in (422, 429):
-                        break
-
-    picked = rank(all_rows, " ".join(queries), args.window, args.limit)
-
+                        break             # the window is shut; stop burning requests
+    picked = rank(all_rows, q, window, limit)
     ages = [a for a in (seen_age_h(s) for s in subs) if a is not None]
-    corpus_age = f"{min(ages):.1f}h" if ages else "cold"
-    health = HEALTH.summary()
-    prov = ", ".join(f"{k}({v['ok']}ok/{v['fail']}fail)" for k, v in health.items()) or "local cache"
+    if not quiet and failed:
+        log(f"reddit: throttled/failed: {', '.join(failed[:8])}")
+    return {"query": queries, "subs": subs, "results": picked, "failed": failed,
+            "candidates": len(all_rows), "fetched": fetched, "requests": spent,
+            "seconds": round(time.time() - t0, 1),
+            "corpus_freshness_h": round(min(ages), 1) if ages else None,
+            "providers": HEALTH.summary()}
+
+
+def search_line(s):
+    """The one italic line every human output starts with."""
+    subs = s["subs"]
+    seen = "corpus cold" if s["corpus_freshness_h"] is None else f"corpus {s['corpus_freshness_h']}h"
+    prov = ", ".join(f"{k}({v['ok']}ok/{v['fail']}fail)" for k, v in s["providers"].items()) or "local cache"
+    line = (f'_{len(s["results"])} threads · {len(subs)} subs · {seen} · '
+            f'{s["candidates"]} candidate posts · {s["fetched"]} live fetches · '
+            f'{s["seconds"]}s · {prov}_')
+    return line
+
+
+def cmd_search(args):
+    set_deadline(args.deadline)
+    queries = args.query or []
+    if not queries:
+        log("reddit search: need a query")
+        return 2
+    subs = select_subs(args)
+    s = collect_search(subs, queries, live=not getattr(args, "offline", False),
+                       budget=args.budget, deadline=args.deadline, window=args.window,
+                       limit=args.limit, fresh=args.fresh)
+    picked = s["results"]
     if args.json:
-        out = json.dumps({"query": queries, "count": len(picked), "providers": health,
-                          "subs_failed": failed, "corpus_freshness_h": min(ages) if ages else None,
-                          "results": picked}, indent=1)
+        out = json.dumps({k: v for k, v in s.items() if k != "providers"} | {"providers": s["providers"]},
+                         indent=1)
     else:
-        buf = [f'## reddit: {", ".join(queries)}',
-               f'_{len(picked)} threads · {len(subs)} subs · corpus {corpus_age} · '
-               f'{len(all_rows)} candidate posts · {fetched} live fetches · '
-               f'{time.time() - t0:.1f}s · {prov}_']
-        if failed:
-            buf.append(f'_throttled: {", ".join(failed[:8])}_')
-        if not all_rows:
-            buf.append("")
-            buf.append("_nothing cached for these subs yet — run `reddit warm` "
-                       "(or `search --live`) to fill the corpus_")
-            buf.append("_other subreddit? just name it: `reddit search \"q\" "
-                       "--subs newsname --live` — unknown subs register themselves_")
+        buf = [f'## reddit: {", ".join(queries)}', search_line(s)]
+        if s["failed"]:
+            buf.append(f'_throttled: {", ".join(s["failed"][:8])}_')
+        if not s["candidates"]:
+            buf += ["", "_nothing cached for these subs yet - pass `--live` (the default), "
+                        "or run `reddit warm` to fill the corpus_",
+                    '_other subreddit? just name it: `reddit search "q" --subs newsname` '
+                    "- unknown subs register themselves_"]
         buf.append("")
         for r in picked:
             body = re.sub(r"\s+", " ", (r.get("selftext") or "")).strip()[:220]
@@ -727,7 +793,7 @@ def cmd_search(args):
         out = "\n".join(buf)
     print(out)
     write_status("search", len(picked) > 0,
-                 f"{len(picked)} hits over {len(subs)} subs, {fetched} live fetches")
+                 f"{len(picked)} hits over {len(subs)} subs, {s['fetched']} live fetches")
     if args.out:
         _atomic_write(Path(args.out), out + "\n")
     return 0 if picked else 1
@@ -787,6 +853,11 @@ def render_thread(post, comments, top=60):
     return "\n".join(lines)
 
 
+def cmd_mcp(args):
+    from . import mcp
+    return mcp.serve()
+
+
 def cmd_thread(args):
     pid = parse_ref(args.ref)
     if not pid:
@@ -808,10 +879,17 @@ def cmd_thread(args):
         log(f"reddit thread: {pid} not in the archive (too new or deleted)")
         write_status("thread", False, f"{pid} not archived")
         return 1
-    comments = arctic_comments(pid)
+    comments = cached_comments(pid)
+    if comments is None:
+        comments = arctic_comments(pid)
+        cache_comments(pid, comments)
     md = render_thread(post, comments, top=args.limit)
     cache_thread(pid, md)
-    print(md)
+    if args.json:
+        print(json.dumps({"id": pid, "post": post, "comments": comments,
+                          "count": len(comments), "markdown": md}, indent=1))
+    else:
+        print(md)
     write_status("thread", True, f"{pid}: {len(comments)} comments")
     if args.out:
         _atomic_write(Path(args.out), md)
@@ -822,14 +900,148 @@ def cmd_sub(args):
     sub = args.sub[2:] if args.sub.startswith("r/") else args.sub
     rows = arctic_posts(sub, "", limit=args.limit, sort=args.sort)
     cache_posts(rows)
-    print(f"## r/{sub} — {args.sort}, {len(rows)} posts")
-    print()
-    for r in rows[:args.limit]:
-        print(f'- {iso(r.get("created_utc"))} · {r.get("score", 0)}pts · '
-              f'{r.get("num_comments", 0)}c · **{html.unescape(r.get("title") or "")}**')
-        print(f'  {url_of(r)}')
+    if args.json:
+        print(json.dumps({"subreddit": sub, "sort": args.sort, "count": len(rows),
+                          "posts": rows[:args.limit]}, indent=1))
+    else:
+        print(f"## r/{sub} — {args.sort}, {len(rows)} posts")
+        print()
+        for r in rows[:args.limit]:
+            print(f'- {iso(r.get("created_utc"))} · {r.get("score", 0)}pts · '
+                  f'{r.get("num_comments", 0)}c · **{html.unescape(r.get("title") or "")}**')
+            print(f'  {url_of(r)}')
     write_status("sub", bool(rows), f"r/{sub} {len(rows)} posts")
     return 0 if rows else 1
+
+
+
+# ---------------------------------------------------------------- ask
+
+NOISE = ("[removed]", "[deleted]")
+
+
+def clean_comment(body: str) -> str:
+    """Comment markdown -> one plain sentence, verbatim words kept."""
+    body = html.unescape(body or "")
+    body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)        # images
+    body = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", body)   # [text](url) -> text
+    body = re.sub(r"https?://\S+", "", body)                 # bare urls
+    body = re.sub(r"^>.*$", "", body, flags=re.M)           # nested quote lines
+    body = re.sub(r"[*_`#>]+", "", body)                    # markdown punctuation
+    return re.sub(r"\s+", " ", body).strip()
+
+
+BOT_AUTHORS = ("automoderator",)
+PROMO_MARKERS = ("you may be interested", "join our", "check out r/", "discord.gg",
+                 "follow me", "my youtube", "subscribe")
+
+
+def _is_bot(author: str) -> bool:
+    a = (author or "").lower()
+    return a.startswith(BOT_AUTHORS) or a.endswith("bot") or a.startswith("bot")
+
+
+def pick_quotes(comments, n, min_len=110, max_len=900):
+    """Top comments by score, cleaned, length-bounded, bots and promos dropped."""
+    out, seen = [], set()
+    for c in sorted(comments, key=lambda c: -int(c.get("score") or 0)):
+        body = c.get("body") or ""
+        if not body or body.strip() in NOISE:
+            continue
+        if _is_bot(c.get("author") or ""):
+            continue
+        text = clean_comment(body)
+        if not (min_len <= len(text) <= max_len):
+            continue
+        low = text.lower()
+        if any(m in low for m in PROMO_MARKERS):
+            continue
+        if len(text.split()) < 15:
+            continue
+        key = text[:90].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"text": text, "author": c.get("author") or "?",
+                    "score": int(c.get("score") or 0),
+                    "created": iso(c.get("created_utc")), "id": c.get("id")})
+        if len(out) >= n:
+            break
+    return out
+
+
+def cmd_ask(args):
+    """A question in, real answers with links out. The command the README shows."""
+    set_deadline(args.deadline)
+    subs = register_subs(args.subs.split(",")) if args.subs else default_subs(priority=True)
+    t0 = time.time()
+    s = collect_search(subs, args.question, live=not args.offline, budget=args.budget,
+                       deadline=args.deadline, window=args.window,
+                       limit=max(args.threads * 3, args.threads), fresh=args.fresh)
+    threads, failed = [], list(s["failed"])
+    for r in s["results"][:args.threads]:
+        pid = r.get("id")
+        if not pid:
+            continue
+        if time.time() - t0 > args.deadline:
+            failed.append("deadline reached")
+            break
+        comments = cached_comments(pid, max_age_h=args.thread_age_h)
+        if comments is None:
+            if args.offline:
+                failed.append(f"{pid}(not cached)")
+                continue
+            log(f"reddit ask: opening {pid} ...")
+            try:
+                comments = arctic_comments(pid, max_pages=1)
+            except FetchError as e:
+                failed.append(f"{pid}({getattr(e, 'code', '?')})")
+                continue
+            cache_comments(pid, comments)
+        post = {"id": pid, "title": r.get("title"), "subreddit": r.get("subreddit"),
+                "score": r.get("score"), "num_comments": r.get("num_comments"),
+                "created_utc": r.get("created_utc"), "permalink": r.get("permalink")}
+        quotes = pick_quotes(comments, args.quotes)
+        if not quotes:
+            continue
+        threads.append({
+            "title": html.unescape(post.get("title") or ""),
+            "url": url_of(post),
+            "subreddit": post.get("subreddit") or r.get("subreddit"),
+            "created": iso(post.get("created_utc")),
+            "score": int(post.get("score") or 0),
+            "num_comments": int(post.get("num_comments") or 0),
+            "quotes": quotes,
+        })
+    total_comments = sum(int(t["num_comments"]) for t in threads)
+    n_quotes = sum(len(t["quotes"]) for t in threads)
+    if args.json:
+        out = json.dumps({"question": " ".join(args.question), "subs": subs,
+                          "threads": threads, "failed": failed,
+                          "seconds": round(time.time() - t0, 1), "fetched": s["fetched"],
+                          "coverage": {"threads": len(threads), "comments": total_comments,
+                                       "quotes": n_quotes}}, indent=1)
+    else:
+        buf = [f'## ask: {" ".join(args.question)}',
+               f'_{len(threads)} threads · {total_comments} comments · {n_quotes} quotes · '
+               f'{len(subs)} subs · {s["fetched"]} live fetches · '
+               f'{round(time.time() - t0, 1)}s_']
+        if failed:
+            buf.append(f'_skipped: {", ".join(failed[:8])}_')
+        if not threads:
+            buf += ["", "_no quotes yet - the archive window may be shut. "
+                        "Try again in a minute, or run `reddit warm` first._"]
+        for i, t in enumerate(threads, 1):
+            buf += ["", f'### {i}. {t["title"]} - r/{t["subreddit"]} · {t["created"]} '
+                        f'· {t["score"]}pts · {t["num_comments"]} comments', t["url"]]
+            for q in t["quotes"]:
+                buf += ["", f'> [{q["score"]}pts] u/{q["author"]}: {q["text"]}']
+        out = "\n".join(buf)
+    print(out)
+    write_status("ask", bool(threads), f"{len(threads)} threads, {n_quotes} quotes")
+    if args.out:
+        _atomic_write(Path(args.out), out + "\n")
+    return 0 if threads else 1
 
 
 def write_status(cmd, ok, detail, providers=None):
@@ -925,7 +1137,7 @@ def cmd_subs(args):
 
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="reddit", description="Reddit research rail (no auth).",
+        prog="reddit", description="Reddit research rail (no login, no API key).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""searching somewhere new - no registration step, no doc to read:
   reddit search "gap year" --subs 6thForm,newsub      # unknown subs are added automatically
@@ -934,6 +1146,7 @@ def build_parser():
   reddit subs                                         # what is in the fan-out list
 Every form accepts 6thForm, r/6thForm or https://reddit.com/r/6thForm.
 The list persists at ~/.local/state/reddit-rail/reddit_subs.json and is what a bare `reddit search` uses.""")
+    p.add_argument("--version", action="version", version=f"reddit-rail {__version__}")
     sub = p.add_subparsers(dest="cmd")
 
     s = sub.add_parser(
@@ -952,8 +1165,9 @@ The list persists at ~/.local/state/reddit-rail/reddit_subs.json and is what a b
     s.add_argument("--workers", type=int, default=1)
     s.add_argument("--all-subs", action="store_true", help="the full 30-sub list")
     s.add_argument("--budget", type=int, default=24, help="max network requests this run")
-    s.add_argument("--live", action="store_true",
-                   help="also fetch fresh posts, within the request budget")
+    s.add_argument("--offline", action="store_true",
+                   help="answer from the local corpus only, never touch the network")
+    s.add_argument("--live", action="store_true", help=argparse.SUPPRESS)
     s.add_argument("--fresh", type=float, default=6.0,
                    help="do not refetch a sub whose cache is younger than N hours")
     s.add_argument("--deadline", type=float, default=150.0)
@@ -965,6 +1179,7 @@ The list persists at ~/.local/state/reddit-rail/reddit_subs.json and is what a b
     t.add_argument("ref", help="url or post id")
     t.add_argument("--limit", type=int, default=60, help="top N comments (default 60)")
     t.add_argument("--refresh", action="store_true", help="ignore the cache")
+    t.add_argument("--json", action="store_true", help="post + comments as one JSON object")
     t.add_argument("--out")
     t.set_defaults(fn=cmd_thread)
 
@@ -972,6 +1187,7 @@ The list persists at ~/.local/state/reddit-rail/reddit_subs.json and is what a b
     u.add_argument("sub")
     u.add_argument("--limit", type=int, default=25)
     u.add_argument("--sort", default="desc", choices=["desc", "asc"])
+    u.add_argument("--json", action="store_true")
     u.set_defaults(fn=cmd_sub)
 
     w = sub.add_parser("warm", help="fetch the stalest subs into the local corpus")
@@ -979,6 +1195,34 @@ The list persists at ~/.local/state/reddit-rail/reddit_subs.json and is what a b
     w.add_argument("--budget", type=int, default=4, help="max requests (window is ~4)")
     w.add_argument("--deadline", type=float, default=180.0)
     w.set_defaults(fn=cmd_warm)
+
+    a = sub.add_parser(
+        "ask", help="a question in, real answers with links out",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Searches, opens the top threads, and prints the highest-scoring "
+                    "comments verbatim with their score and permalink.",
+        epilog="""examples:
+  reddit ask "is a gap year worth it" --subs 6thForm,UniUK
+  reddit ask "bose anc hiss" --threads 3 --quotes 8 --json""")
+    a.add_argument("question", nargs="+")
+    a.add_argument("--subs", help="comma list, overrides the curated list")
+    a.add_argument("--threads", type=int, default=3, help="how many threads to open (default 3)")
+    a.add_argument("--quotes", type=int, default=5, help="quotes per thread (default 5)")
+    a.add_argument("--comment-pool", type=int, default=120,
+                   help="comments paged per thread before picking (default 120)")
+    a.add_argument("--window", default="all", choices=["hour", "day", "week", "month", "year", "all"])
+    a.add_argument("--budget", type=int, default=12, help="max search requests this run")
+    a.add_argument("--deadline", type=float, default=90.0)
+    a.add_argument("--fresh", type=float, default=6.0)
+    a.add_argument("--thread-age-h", type=float, default=72.0,
+                   help="reuse an opened thread younger than N hours (default 72)")
+    a.add_argument("--offline", action="store_true")
+    a.add_argument("--json", action="store_true")
+    a.add_argument("--out")
+    a.set_defaults(fn=cmd_ask)
+
+    m = sub.add_parser("mcp", help="stdio MCP server: reddit_search, reddit_thread, reddit_ask")
+    m.set_defaults(fn=cmd_mcp)
 
     pr = sub.add_parser("probe", help="health check every provider, write the status artifact")
     pr.set_defaults(fn=cmd_probe)
@@ -1016,6 +1260,8 @@ def main(argv=None):
         return 2
     except KeyboardInterrupt:
         return 130
+    finally:
+        DEADLINE[0] = 0.0
 
 
 if __name__ == "__main__":

@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 *.db
 *.sqlite3
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
